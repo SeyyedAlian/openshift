@@ -20,3 +20,26 @@ This repository contains two helper scripts for managing an **isolated private O
 **Usage:**
 ```bash
 ./ocp-backup.sh
+```
+
+# 2. Node Cleanup Script
+
+Useful when node storage grows unexpectedly.
+
+Detects unused images, completed/failed pods, large logs, and ephemeral volumes.
+
+Supports two modes:
+
+- Dry-run → shows what can be cleaned.
+- Clean → actually deletes unused resources.
+
+Usage:
+
+- Step 1: See what can be safely deleted
+```bash
+./ocp-node-cleanup.sh dry
+```
+- Step 2: Confirm and clean
+```bash  
+./ocp-node-cleanup.sh clean
+```
