@@ -1,147 +1,107 @@
-Skip to content
-Navigation Menu
-SeyyedAlian
-openshift
+#!/bin/bash
+# ============================================================
+# OpenShift Comprehensive Project Backup Script
+# Includes Real External Image Resolution from ImageStreams
+# Author: Mahmood SeyyedAlian + ChatGPT GPT-5
+# ./BackupAllProject.sh /Backup Directory   all 
+# ============================================================
 
-Type / to search
-Code
-Issues
-Pull requests
-Actions
-Projects
-Wiki
-Security
-Insights
-Settings
-openshift
-/
-Name your file...
-in
-main
+set -euo pipefail
 
-Edit
+# ------------- CONFIGURATION -----------------
+BACKUP_ROOT=${1:-"/tmp/openshift-backup"}
+TARGET_PROJECT=${2:-"all"}     # "all" or specific project name
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BASE_DIR="${BACKUP_ROOT}/backup_${TIMESTAMP}"
+mkdir -p "$BASE_DIR"
+# ---------------------------------------------
 
-Preview
-Indent mode
+echo " Starting OpenShift backup..."
+echo "📁 Backup directory: $BASE_DIR"
 
-Spaces
-Indent size
-
-2
-Line wrap mode
-
-No wrap
-Editing file contents
-Selection deleted
-90
-91
-92
-93
-94
-95
-96
-97
-98
-99
-100
-101
-102
-103
-104
-105
-106
-107
-108
-109
-110
-111
-112
-113
-114
-115
-116
-117
-118
-119
-120
-121
-122
-123
-124
-125
-126
-127
-128
-129
-130
-131
-132
-133
-134
-135
-136
-137
-138
-139
-140
-141
-142
-143
-144
-        
-        # Replace image registry URLs if needed
-        if [[ "$resource_type" =~ ^(deployment|deploymentconfig|statefulset|daemonset|cronjob|job)$ ]]; then
-            replace_registry_urls "$final_file"
-        fi
-    done
-}
-
-# List of resource types to backup
-RESOURCE_TYPES=(
-    "deployment"
-    "deploymentconfig"
-    "statefulset"
-    "daemonset"
-    "replicaset"
-    "route"
-    "service"
-    "ingress"
-    "networkpolicy"
-    "configmap"
-    "secret"
-    "persistentvolumeclaim"
-    "storageclass"
-    "serviceaccount"
-    "role"
-    "rolebinding"
-    "imagestream"
-    "buildconfig"
-    "cronjob"
-    "job"
-)
-
-# Backup all resource types
-for resource_type in "${RESOURCE_TYPES[@]}"; do
-    backup_resources "$resource_type"
+# ---------- Check dependencies ---------------
+for bin in oc jq; do
+  if ! command -v $bin &>/dev/null; then
+    echo "❌ Error: Required tool '$bin' not found. Please install it first."
+    exit 1
+  fi
 done
 
-# Backup project metadata
-echo "Backing up project metadata..."
-oc get project "$PROJECT_NAME" -o yaml | \
-if [ "$USE_NEAT" = true ]; then kubectl-neat; else cat; fi > "$BASE_DIR/project.yaml"
+# ---------- Function: Build Image Map ----------
+build_image_map() {
+  local ns=$1
+  declare -gA IMAGE_MAP=()
+  echo "🧩 Building image map for namespace: $ns"
+  local json
+  json=$(oc get imagestream -n "$ns" -o json 2>/dev/null || echo "")
+  [[ -z "$json" ]] && return 0
 
-# Create archive only if resources exist
-if [ "$(find "$BASE_DIR" -mindepth 1 -type d | wc -l)" -gt 0 ]; then
-    echo "Creating compressed archive..."
-    tar -czf "${BACKUP_FOLDER}/${PROJECT_NAME}_${TIMESTAMP}.tar.gz" -C "$BACKUP_FOLDER" "${PROJECT_NAME}_${TIMESTAMP}"
-    
-    echo "Backup completed successfully!"
-    echo "Backup location: $BASE_DIR"
-    echo "Compressed archive: ${BACKUP_FOLDER}/${PROJECT_NAME}_${TIMESTAMP}.tar.gz"
+  echo "$json" | jq -r '
+    .items[] |
+    .metadata.name as $name |
+    (.status.tags[]? | "\($name):\(.tag)=\(.items[0].dockerImageReference)")' \
+  2>/dev/null | while read -r line; do
+    [[ -z "$line" ]] && continue
+    local key value
+    key=$(echo "$line" | cut -d'=' -f1)
+    value=$(echo "$line" | cut -d'=' -f2-)
+    IMAGE_MAP["$key"]="$value"
+  done
+}
+
+# ---------- Function: Backup Project ----------
+backup_project() {
+  local ns=$1
+  local outdir="${BASE_DIR}/${ns}"
+  mkdir -p "$outdir"
+  echo " Backing up project: $ns"
+
+  # Get all resources
+  echo " Exporting resource definitions..."
+  oc get all -n "$ns" -o yaml > "${outdir}/all.yaml" 2>/dev/null || true
+  oc get is -n "$ns" -o yaml > "${outdir}/imagestreams.yaml" 2>/dev/null || true
+  oc get cm,secret,svcroute,pvc,role,rolebinding,sa -n "$ns" -o yaml > "${outdir}/extras.yaml" 2>/dev/null || true
+
+  # Build image map
+  build_image_map "$ns"
+
+  # Backup workloads individually with real image mapping
+  local kinds=(deployment deploymentconfig statefulset daemonset cronjob job)
+  for kind in "${kinds[@]}"; do
+    echo "🔹 Processing ${kind}s..."
+    mkdir -p "${outdir}/${kind}"
+    local names
+    names=$(oc get "$kind" -n "$ns" -o name 2>/dev/null || true)
+    for item in $names; do
+      local name yamlfile
+      name=$(basename "$item")
+      yamlfile="${outdir}/${kind}/${name}.yaml"
+      oc get "$kind" "$name" -n "$ns" -o yaml > "$yamlfile"
+
+      # Replace internal image references
+      for key in "${!IMAGE_MAP[@]}"; do
+        local real_image=${IMAGE_MAP[$key]}
+        sed -i "s#image-registry\.openshift-image-registry\.svc:5000/${ns}/${key}#${real_image}#g" "$yamlfile"
+      done
+    done
+  done
+
+  # Backup routes and configmaps separately
+  oc get route -n "$ns" -o yaml > "${outdir}/routes.yaml" 2>/dev/null || true
+  oc get configmap -n "$ns" -o yaml > "${outdir}/configmaps.yaml" 2>/dev/null || true
+
+  echo "✅ Project $ns backup complete."
+}
+
+# ---------- Main Execution ----------
+if [ "$TARGET_PROJECT" == "all" ]; then
+  echo " Backing up all non-system projects..."
+  for proj in $(oc get projects -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -vE '^(openshift|kube|default)$'); do
+    backup_project "$proj"
+  done
 else
-    echo "No resources found in project $PROJECT_NAME, removing empty backup directory..."
-    rm -rf "$BASE_DIR"
-    exit 1
+  backup_project "$TARGET_PROJECT"
 fi
-Use Control + Shift + m to toggle the tab key moving focus. Alternatively, use esc then tab to move to the next interactive element on the page.
-New File at / · SeyyedAlian/openshift
+
+echo " All backups completed successfully!"
+echo "📂 Backup stored at: $BASE_DIR"
